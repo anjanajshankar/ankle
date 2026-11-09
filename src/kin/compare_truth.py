@@ -3,6 +3,10 @@
 
 usage: python compare_truth.py <truth_prefix> <label>=<result.mot> [<label>=<result.mot> ...]
                                [--cutoff 6] [--coords ankle,knee,hip,lumbar,pelvis]
+                               [--filter-angles] [--summary FILE --tag TAG]
+
+--filter-angles  also low-pass the angles of results without an exact derivative file (what ID receives)
+--summary FILE   append one CSV row per result: tag,label,cutoff,filtered_angles,mean_q,mean_qdd,ankle_q,ankle_qdd
 
 For each result:
   - angles q are compared directly with the truth;
@@ -37,7 +41,9 @@ def lowpass(y, dt, cutoff):
 
 def main():
     args = sys.argv[1:]
-    cutoff, keys = 6.0, ["ankle", "knee", "hip", "lumbar", "pelvis_tilt", "pelvis_list", "pelvis_rotation"]
+    cutoff, keys = 6.0, ["ankle", "knee", "hip", "lumbar", "pelvis_tilt", "pelvis_list", "pelvis_obliquity",
+                         "pelvis_rotation"]
+    filter_angles, summary, tag = False, None, ""
     rest = []
     i = 0
     while i < len(args):
@@ -45,6 +51,12 @@ def main():
             cutoff = float(args[i + 1]); i += 2
         elif args[i] == "--coords":
             keys = args[i + 1].split(","); i += 2
+        elif args[i] == "--filter-angles":
+            filter_angles = True; i += 1
+        elif args[i] == "--summary":
+            summary = args[i + 1]; i += 2
+        elif args[i] == "--tag":
+            tag = args[i + 1]; i += 2
         else:
             rest.append(args[i]); i += 1
     if len(rest) < 2:
@@ -78,6 +90,7 @@ def main():
     print("\nRMS error vs truth: q in deg, q-ddot in deg/s^2")
     print(head)
     totals = np.zeros(2 * len(loaded))
+    ankle = np.zeros(2 * len(loaded)); n_ankle = 0
     for n in names:
         true_q = tq[:, tc.index(n)]
         true_qdd = tqdd[:, tc.index(n)]
@@ -89,13 +102,26 @@ def main():
             if uc is not None and n in uc:
                 qdd = column(uc, ud, n, t)
             else:
-                qdd = np.gradient(np.gradient(lowpass(q, dt, cutoff), dt), dt)
+                qf = lowpass(q, dt, cutoff)
+                qdd = np.gradient(np.gradient(qf, dt), dt)
+                if filter_angles:
+                    q = qf
             eq.append(np.sqrt(np.mean((q - true_q)[keep] ** 2)))
             eqdd.append(np.sqrt(np.mean((qdd - true_qdd)[keep] ** 2)))
         totals += np.nan_to_num(np.array(eq + eqdd))
+        if n.startswith("ankle_angle"):
+            ankle += np.nan_to_num(np.array(eq + eqdd)); n_ankle += 1
         print(f"{n:22s}" + "".join(f"{e:14.2f}" for e in eq) + "".join(f"{e:16.0f}" for e in eqdd))
     print(f"{'mean':22s}" + "".join(f"{e / len(names):14.2f}" for e in totals[:len(loaded)])
           + "".join(f"{e / len(names):16.0f}" for e in totals[len(loaded):]))
+    if summary:
+        L = len(loaded)
+        with open(summary, "a") as f:
+            for k, (label, rc, rd, uc, ud) in enumerate(loaded):
+                exact = uc is not None
+                f.write(f"{tag},{label},{'' if exact else cutoff},{int(filter_angles and not exact)},"
+                        f"{totals[k] / len(names):.4f},{totals[L + k] / len(names):.2f},"
+                        f"{ankle[k] / max(1, n_ankle):.4f},{ankle[L + k] / max(1, n_ankle):.2f}\n")
 
 
 if __name__ == "__main__":

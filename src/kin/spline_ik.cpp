@@ -38,6 +38,7 @@
 #include "mot_io.h"
 #include "opensim_fk.h"
 #include "parseTRC.h"
+#include "trc_io.h"
 
 namespace {
 
@@ -139,19 +140,26 @@ int main(int argc_in, char** argv_in) {
         OpenSimFK fk(argv[1], wanted, excluded);
         const int nq = static_cast<int>(fk.coordinate_names().size());
         const int M = static_cast<int>(fk.marker_names().size());
-        const int F = static_cast<int>(trace.trajectories_by_marker.begin()->second.marker_pts.size());
+        const int F_all = static_cast<int>(trace.trajectories_by_marker.begin()->second.marker_pts.size());
         const double dt = trace.time_step_millis / 1000.0;
-        const double T = (F - 1) * dt;
+        const double trc_t0 = trc_first_time(argv[2]);   // time of marker frame 0
 
-        // ---- initial IK result: read it now, its start time also aligns the GRF events ----
+        // ---- initial IK result: the solve covers only the frames inside its time range ----
         OpenSim::Storage init(argv[3]);
         if (init.isInDegrees()) fk.model().getSimbodyEngine().convertDegreesToRadians(init);
         // (Uses the same Storage calls as fk_check: column labels + state vectors.)
         const OpenSim::Array<std::string>& labels = init.getColumnLabels();
         std::vector<double> t_init(init.getSize());
         for (int r = 0; r < init.getSize(); ++r) t_init[r] = init.getStateVector(r)->getTime();
-        std::vector<double> t_frames(F);
+        const int i0 = std::max(0, static_cast<int>(std::ceil((t_init.front() - trc_t0) / dt - 1e-6)));
+        const int i1 = std::min(F_all - 1, static_cast<int>(std::floor((t_init.back() - trc_t0) / dt + 1e-6)));
+        if (i1 - i0 < 4) throw std::runtime_error("initial IK and marker data barely overlap in time");
+        const int F = i1 - i0 + 1;                    // frames solved
+        const double t_abs0 = trc_t0 + i0 * dt;       // absolute time of the first solved frame
+        const double T = (F - 1) * dt;
+        std::vector<double> t_frames(F);              // spline time, 0 at the first solved frame
         for (int i = 0; i < F; ++i) t_frames[i] = i * dt;
+        std::cout << "solving marker frames " << i0 << "-" << i1 << " (" << t_abs0 << "-" << t_abs0 + T << " s)\n";
 
         // ---- spline shape: uniform, or denser around foot events if a GRF file is given ----
         BSpline spline;
@@ -165,7 +173,7 @@ int main(int argc_in, char** argv_in) {
             }
             std::vector<double> events = detect_contact_events(argv[7]);
             std::cout << "foot events (s):";
-            for (double& e : events) { std::cout << " " << e; e -= t_init.front(); }   // to spline time
+            for (double& e : events) { std::cout << " " << e; e -= t_abs0; }   // to spline time
             std::cout << "\n";
             spline = make_clamped(0.0, T, event_knots(T, spacing, dense, events, before, after));
         } else {
@@ -183,7 +191,7 @@ int main(int argc_in, char** argv_in) {
             if (col > 0) {
                 std::vector<double> yi(init.getSize());
                 for (int r = 0; r < init.getSize(); ++r) yi[r] = init.getStateVector(r)->getData()[col - 1];
-                for (int i = 0; i < F; ++i) y[i] = interp(t_init, yi, t_frames[i] + t_init.front());
+                for (int i = 0; i < F; ++i) y[i] = interp(t_init, yi, t_frames[i] + t_abs0);
             } else {
                 std::cout << "note: " << fk.coordinate_names()[j] << " not in initial .mot, starting at 0\n";
             }
@@ -215,7 +223,7 @@ int main(int argc_in, char** argv_in) {
             f.scale.resize(M);
             for (int m = 0; m < M; ++m) {
                 const std::string& name = fk.marker_names()[m];
-                const MarkerPt& pt = trace.trajectories_by_marker.at(name).marker_pts[i];
+                const MarkerPt& pt = trace.trajectories_by_marker.at(name).marker_pts[i0 + i];
                 if (pt.observed_coord) {
                     f.observed_marker_positions[m] = *pt.observed_coord;
                     ++observed;
@@ -317,7 +325,7 @@ int main(int argc_in, char** argv_in) {
 
         // ---- write q, and its exact derivatives from the splines: q-dot (_u) and q-ddot (_udot) ----
         std::vector<double> t_out(F);
-        for (int i = 0; i < F; ++i) t_out[i] = t_frames[i] + t_init.front();
+        for (int i = 0; i < F; ++i) t_out[i] = t_frames[i] + t_abs0;
         for (int d = 0; d <= 2; ++d) {
             std::vector<std::vector<double>> vals(F, std::vector<double>(nq));
             for (int i = 0; i < F; ++i)

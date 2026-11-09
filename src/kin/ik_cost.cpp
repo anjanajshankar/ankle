@@ -6,7 +6,11 @@
 // (soft-tissue artifact, noise) rather than the bones; if it is worse than another method,
 // it is not reaching the best fit.
 //
-// usage: ik_cost <model.osim> <markers.trc> <ik_setup.xml|-> [--no-arms] label=motion.mot [label=motion.mot ...]
+// usage: ik_cost <model.osim> <markers.trc> <ik_setup.xml|-> [--no-arms] [--marker-csv FILE]
+//                label=motion.mot [label=motion.mot ...]
+//
+// --marker-csv FILE appends one row per marker and motion: label,trc,marker,body,sum_sq_mm2,count
+// (squared residuals summed over frames), so many trials can be pooled afterwards (make_weights.py).
 //
 // For each motion: weighted cost = 1/2 * sum over frames and markers of |weight/sigma * (FK - observed)|^2
 // (the data part of spline_ik's cost; no roughness penalty), plus the unweighted RMS marker error
@@ -20,17 +24,22 @@
 #include <string>
 #include <vector>
 
+#include <fstream>
+
 #include "ik_weights.h"
 #include "opensim_fk.h"
 #include "parseTRC.h"
+#include "trc_io.h"
 
 int main(int argc, char** argv) {
     std::vector<std::string> excluded;
     std::vector<std::string> pos;
     std::vector<std::pair<std::string, std::string>> motions;
+    std::string marker_csv;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--no-arms") excluded = arm_body_prefixes();
+        else if (a == "--marker-csv" && i + 1 < argc) marker_csv = argv[++i];
         else if (pos.size() < 3) pos.push_back(a);
         else {
             const auto eq = a.find('=');
@@ -39,7 +48,7 @@ int main(int argc, char** argv) {
         }
     }
     if (pos.size() < 3 || motions.empty()) {
-        std::cerr << "usage: ik_cost <model.osim> <markers.trc> <ik_setup.xml|-> [--no-arms] label=motion.mot ...\n";
+        std::cerr << "usage: ik_cost <model.osim> <markers.trc> <ik_setup.xml|-> [--no-arms] [--marker-csv FILE] label=motion.mot ...\n";
         return 1;
     }
 
@@ -64,7 +73,7 @@ int main(int argc, char** argv) {
             scale[m] = std::sqrt(w) / trace.trajectories_by_marker.at(n).marker_pts[0].measurement_uncertainty.x_mm;
         }
 
-        double t_start = 0.0;   // trc frame 0 is taken to be the first motion file's first time
+        const double t_start = trc_first_time(pos[1]);   // time of marker frame 0
         std::cout << "\n" << std::string(14, ' ') << "  weighted cost   RMS (mm)   RMS by body (mm)\n";
         for (size_t f = 0; f < motions.size(); ++f) {
             OpenSim::Storage sto(motions[f].second);
@@ -73,7 +82,6 @@ int main(int argc, char** argv) {
             const int R = sto.getSize();
             std::vector<double> tm(R);
             for (int r = 0; r < R; ++r) tm[r] = sto.getStateVector(r)->getTime();
-            if (f == 0) t_start = tm.front();
 
             std::vector<int> col(nq);
             for (int j = 0; j < nq; ++j) {
@@ -84,9 +92,12 @@ int main(int argc, char** argv) {
             double cost = 0, sum_sq = 0;
             long n_obs = 0;
             std::map<std::string, std::pair<double, long>> by_body;
+            std::vector<double> m_sum(M, 0.0);
+            std::vector<long> m_cnt(M, 0);
             std::vector<double> q(nq, 0.0), p;
             for (int i = 0; i < F; ++i) {
                 const double t = t_start + i * dt;
+                if (t < tm.front() - 1e-6 || t > tm.back() + 1e-6) continue;   // outside this motion
                 int r = 0;
                 while (r + 1 < R && tm[r + 1] <= t) ++r;
                 const int r2 = std::min(r + 1, R - 1);
@@ -107,6 +118,8 @@ int main(int argc, char** argv) {
                     cost += 0.5 * scale[m] * scale[m] * e2;
                     sum_sq += e2;
                     ++n_obs;
+                    m_sum[m] += e2;
+                    ++m_cnt[m];
                     auto& b = by_body[fk.marker_body_names()[m]];
                     b.first += e2;
                     b.second += 1;
@@ -114,6 +127,12 @@ int main(int argc, char** argv) {
             }
             std::printf("%-14s  %13.6e   %8.3f  ", motions[f].first.c_str(), cost, std::sqrt(sum_sq / std::max(1L, n_obs)));
             for (const auto& [body, b] : by_body) std::printf(" %s %.2f", body.c_str(), std::sqrt(b.first / b.second));
+            if (!marker_csv.empty()) {
+                std::ofstream csv(marker_csv, std::ios::app);
+                for (int m = 0; m < M; ++m)
+                    csv << motions[f].first << "," << pos[1] << "," << fk.marker_names()[m] << ","
+                        << fk.marker_body_names()[m] << "," << m_sum[m] << "," << m_cnt[m] << "\n";
+            }
             std::printf("\n");
         }
     } catch (const std::exception& e) {

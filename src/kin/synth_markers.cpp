@@ -14,9 +14,12 @@
 //
 // usage: synth_markers <model.osim> <source_ik.mot> <out_prefix>
 //                      [--noise 1.0] [--sta 1.0] [--truth-spacing 0.037] [--stride 1.144] [--seed 1]
+//                      [--markers-like measured.trc]   (only write the markers that file contains)
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <sstream>
 #include <iostream>
 #include <map>
 #include <random>
@@ -46,13 +49,27 @@ double sta_size_mm(const std::string& body) {
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::cerr << "usage: synth_markers <model.osim> <source_ik.mot> <out_prefix> [--noise 1.0] [--sta 1.0]"
-                     " [--truth-spacing 0.037] [--stride 1.144] [--seed 1]\n";
+                     " [--truth-spacing 0.037] [--stride 1.144] [--seed 1] [--markers-like measured.trc]\n";
         return 1;
     }
     double noise_mm = 1.0, sta_scale = 1.0, truth_spacing = 0.037, stride = 1.144;
     unsigned seed = 1;
+    std::vector<std::string> marker_names;   // empty = all model markers
     for (int i = 4; i + 1 < argc; i += 2) {
         const std::string k = argv[i];
+        if (k == "--markers-like") {
+            std::ifstream in(argv[i + 1]);
+            std::string line;
+            for (int l = 0; l < 4 && std::getline(in, line); ++l) {}
+            std::stringstream ss(line);
+            std::string field;
+            for (int col = 0; std::getline(ss, field, '\t'); ++col) {
+                field.erase(field.find_last_not_of(" \r\n") + 1);
+                if (col >= 2 && !field.empty()) marker_names.push_back(field);
+            }
+            if (marker_names.empty()) { std::cerr << "no marker names in " << argv[i + 1] << "\n"; return 1; }
+            continue;
+        }
         const double v = std::stod(argv[i + 1]);
         if (k == "--noise") noise_mm = v;
         else if (k == "--sta") sta_scale = v;
@@ -64,7 +81,7 @@ int main(int argc, char** argv) {
     const std::string prefix = argv[3];
 
     try {
-        OpenSimFK fk(argv[1], {});   // all markers
+        OpenSimFK fk(argv[1], marker_names);   // all model markers, or those of --markers-like
         const int nq = static_cast<int>(fk.coordinate_names().size());
         const int M = static_cast<int>(fk.marker_names().size());
 

@@ -31,4 +31,20 @@ inline void write_trc(const std::string& path, const std::vector<std::string>& m
     }
 }
 
+// Time of the first data row of a .trc file (the "Time" column), so frames can be matched to
+// motions that start later (e.g. an IK run over only part of the trial).
+inline double trc_first_time(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("trc_first_time: cannot open " + path);
+    std::string line;
+    for (int i = 0; i < 5 && std::getline(in, line); ++i) {}
+    while (std::getline(in, line)) {
+        if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+        const auto a = line.find('\t');
+        const auto b = line.find('\t', a + 1);
+        return std::stod(line.substr(a + 1, b - a - 1));
+    }
+    throw std::runtime_error("trc_first_time: no data rows in " + path);
+}
+
 #endif
