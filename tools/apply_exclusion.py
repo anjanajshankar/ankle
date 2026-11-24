@@ -6,7 +6,7 @@ import csv, math, os, re, sys, statistics, collections
 w = sys.argv[1].rstrip('/')
 trials = {f"P{r['participant']}_{r['trial']}": r for r in csv.DictReader(open(f'{w}/trials.csv'))}
 ss, n = collections.defaultdict(float), collections.defaultdict(int)
-for r in csv.reader(open(f'{w}/marker_residuals_pass1.csv')):
+for r in csv.reader(open(sys.argv[2] if len(sys.argv) > 2 else f'{w}/marker_residuals_pass1.csv')):
     if len(r) >= 6 and r[0] in trials:
         try: ss[r[0]] += float(r[4]); n[r[0]] += int(r[5])
         except ValueError: pass
