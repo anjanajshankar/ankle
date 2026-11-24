@@ -31,6 +31,10 @@ public:
     const std::vector<std::string>& marker_names() const override { return marker_names_; }
     void marker_positions(const std::vector<double>& q, std::vector<double>& out_m) override;
 
+    // Orientation (in the lab) of the frame each marker's location is expressed in, at the q of the
+    // last marker_positions() call. A marker offset d (that frame, metres) moves the marker by R * d.
+    bool marker_rotations(std::vector<double>& R_out) override;
+
     // true for rotational coordinates (radians), false for translations (metres).
     const std::vector<bool>& rotational() const { return rotational_; }
 
@@ -43,6 +47,11 @@ public:
 
     // Name of the body each marker is attached to (same order as marker_names()).
     const std::vector<std::string>& marker_body_names() const { return marker_bodies_; }
+
+    // Name of the frame each marker's location is expressed in (usually its body), and that
+    // location in metres (3 per marker), as set in the model.
+    const std::vector<std::string>& marker_frame_names() const { return marker_frames_; }
+    const std::vector<double>& marker_locations() const { return marker_locations_; }
 
 private:
     struct Coupler {
@@ -63,6 +72,8 @@ private:
     std::vector<const OpenSim::Marker*> markers_;
     std::vector<std::string> marker_names_;
     std::vector<std::string> marker_bodies_;
+    std::vector<std::string> marker_frames_;
+    std::vector<double> marker_locations_;
 };
 
 #endif

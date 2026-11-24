@@ -74,6 +74,9 @@ OpenSimFK::OpenSimFK(const std::string& model_path, const std::vector<std::strin
             markers_.push_back(&ms.get(name));
             marker_names_.push_back(name);
             marker_bodies_.push_back(ms.get(name).getParentFrame().findBaseFrame().getName());
+            marker_frames_.push_back(ms.get(name).getParentFrame().getName());
+            const SimTK::Vec3& p = ms.get(name).get_location();
+            for (int a = 0; a < 3; ++a) marker_locations_.push_back(p[a]);
         } else {
             std::cout << "note: marker " << name << " is not in the model, skipped\n";
         }
@@ -106,4 +109,15 @@ void OpenSimFK::marker_positions(const std::vector<double>& q, std::vector<doubl
         out_m[3 * m + 1] = p[1];
         out_m[3 * m + 2] = p[2];
     }
+}
+
+bool OpenSimFK::marker_rotations(std::vector<double>& R_out) {
+    // The state was realized to Position in the last marker_positions() call.
+    R_out.resize(9 * markers_.size());
+    for (size_t m = 0; m < markers_.size(); ++m) {
+        const SimTK::Transform& X = markers_[m]->getParentFrame().getTransformInGround(*state_);
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) R_out[9 * m + 3 * i + j] = X.R().asMat33()(i, j);
+    }
+    return true;
 }

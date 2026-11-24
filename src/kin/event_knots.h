@@ -12,6 +12,12 @@
 // Returns the event times, sorted, in the file's own time.
 std::vector<double> detect_contact_events(const std::string& grf_mot_path, double threshold_N = 20.0);
 
+// Foot contacts only (rising crossings), with the side: 'r' or 'l'. The side is guessed from the
+// column name: left if it starts with "l_" or contains "_l_" or "left", otherwise right.
+// (Check the printout if your plates are named by number rather than by foot.)
+struct ContactOnset { double time; char side; };
+std::vector<ContactOnset> detect_contact_onsets(const std::string& grf_mot_path, double threshold_N = 20.0);
+
 // Interior knots on [0, T]: a regular grid every base_spacing, plus a dense grid every
 // dense_spacing from (event - before) to (event + after) around each event.
 // Knots closer together than dense_spacing are merged, so no interval is shorter than that.

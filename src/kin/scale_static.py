@@ -30,8 +30,7 @@ def measurements():
         m[f'thigh_{s}'] = ([(f'SIPS_{side}', f'epi_lat_{side}'), (f'SIPS_{side}', f'epi_med_{side}')],
                            {f'femur_{s}': 'X Y Z', f'patella_{s}': 'X Y Z'})
         m[f'shank_{s}'] = ([(f'epi_lat_{side}', f'mal_lat_{side}'), (f'epi_med_{side}', f'mal_med_{side}')],
-                           {f'tibia_{s}': 'X Y Z', f'talus_{s}': 'X Y Z'})
-        m[f'foot_{s}'] = ([(f'cal_back_{side}', f'forefood_lat_{side}')], {f'calcn_{s}': 'X Y Z', f'toes_{s}': 'X Y Z'})
+                           {f'tibia_{s}': 'X Y Z', f'talus_{s}': 'X Y Z', f'calcn_{s}': 'X Y Z', f'toes_{s}': 'X Y Z'})  # feet scaled with the shank
     return m
 
 def markers_of(osim):

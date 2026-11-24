@@ -1,0 +1,6 @@
+work/
+*.log
+step2_jobs*.txt
+addbio_spline_jobs.txt
+one_job.txt
+*_log.txt

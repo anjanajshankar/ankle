@@ -3,7 +3,7 @@
 //
 // Unknowns:  spline coefficients (number of knot intervals + 3 per free coordinate).
 // Residuals: for every frame and marker, weight/sigma * (FK position - observed position).
-// Fixed:     segment scaling and marker offsets (taken from the scaled model).
+// Fixed:     segment scaling, and marker offsets unless --fit-offsets (taken from the scaled model).
 // Start:     splines fitted to an existing IK result (e.g. OpenSim's), then refined by Ceres.
 //
 // usage: spline_ik <model.osim> <markers.trc> <init_ik.mot> <out.mot>
@@ -18,6 +18,19 @@
 //   --smooth LAMBDA             roughness penalty: adds LAMBDA * integral of q-ddot^2 dt for every
 //                               coordinate (rad/s^2; translations scaled so 1 cm counts like 1 deg).
 //                               0 (default) = off. Larger = smoother. Sweep it on synthetic data.
+//   --fit-offsets SIGMA_MM      also estimate where each marker really sits on its body: a 3D offset per
+//                               marker (constant over the trial), with a Gaussian prior of SIGMA_MM per
+//                               axis around the model's position. Writes <out>_offsets.csv.
+//                               Parts of the offsets that look exactly like a joint-angle change cannot be
+//                               told apart from it; the prior decides those, so keep SIGMA_MM realistic
+//                               (about 10 mm for skin markers placed by hand).
+//   --event-smooth-factor F     with a GRF file and --smooth: inside the dense windows around foot events
+//                               the roughness penalty is LAMBDA * F instead of LAMBDA (e.g. 0.1), so the
+//                               motion may change fast where the physics says it can. Default 1.
+//   --shape-only                with --fit-offsets: a body's offsets may only change the shape of its
+//                               marker cluster, never shift or rotate the whole cluster (those look exactly
+//                               like joint-angle changes). Bodies with 1 marker get no offset, 2 markers 1
+//                               number (their distance), n >= 3 markers 3n - 6 numbers.
 
 #include <ceres/ceres.h>
 
@@ -35,6 +48,7 @@
 #include "event_knots.h"
 #include "frame_residual.h"
 #include "ik_weights.h"
+#include "marker_offsets.h"
 #include "mot_io.h"
 #include "opensim_fk.h"
 #include "parseTRC.h"
@@ -65,20 +79,55 @@ private:
     std::vector<double> w_;
 };
 
+// Offsets: none; full (one size-3 block per marker after the coefficient blocks, see
+// frame_eval_offsets); or shape-only (one block per body group, see frame_eval_shape_offsets).
+enum class OffsetMode { none, full, shape };
+
 class FrameCost : public ceres::CostFunction {
 public:
-    FrameCost(MarkerFK* fk, FrameData frame) : fk_(fk), frame_(std::move(frame)) {
-        set_num_residuals(static_cast<int>(3 * frame_.observed_marker_positions.size()));
+    FrameCost(MarkerFK* fk, FrameData frame, OffsetMode mode, const ShapeOffsets* shape)
+        : fk_(fk), frame_(std::move(frame)), mode_(mode), shape_(shape) {
+        const size_t M = frame_.observed_marker_positions.size();
+        set_num_residuals(static_cast<int>(3 * M));
         const size_t n = fk_->coordinate_names().size() * frame_.active.size();
         for (size_t p = 0; p < n; ++p) mutable_parameter_block_sizes()->push_back(1);
+        if (mode_ == OffsetMode::full)
+            for (size_t m = 0; m < M; ++m) mutable_parameter_block_sizes()->push_back(3);
+        if (mode_ == OffsetMode::shape)
+            for (int k : shape_->size) if (k > 0) mutable_parameter_block_sizes()->push_back(k);
     }
     bool Evaluate(double const* const* params, double* residuals, double** jacobians) const override {
-        frame_eval(*fk_, frame_, params, residuals, jacobians);
+        if (mode_ == OffsetMode::full) frame_eval_offsets(*fk_, frame_, params, residuals, jacobians);
+        else if (mode_ == OffsetMode::shape) frame_eval_shape_offsets(*fk_, frame_, *shape_, params, residuals, jacobians);
+        else frame_eval(*fk_, frame_, params, residuals, jacobians);
         return true;
     }
 private:
     MarkerFK* fk_;
     FrameData frame_;
+    OffsetMode mode_;
+    const ShapeOffsets* shape_;
+};
+
+// Prior on an offset block of n numbers (metres): r = value_mm / sigma_mm, i.e. offsets are expected
+// to be about sigma_mm per axis. Same units as the marker residuals (error / uncertainty). For a
+// shape-only block the basis is orthonormal, so this is the same prior on the offsets themselves.
+class OffsetPrior : public ceres::CostFunction {
+public:
+    OffsetPrior(double sigma_mm, int n) : k_(1000.0 / sigma_mm), n_(n) {
+        set_num_residuals(n);
+        mutable_parameter_block_sizes()->push_back(n);
+    }
+    bool Evaluate(double const* const* params, double* residuals, double** jacobians) const override {
+        for (int i = 0; i < n_; ++i) residuals[i] = k_ * params[0][i];
+        if (jacobians && jacobians[0])
+            for (int i = 0; i < n_; ++i)
+                for (int k = 0; k < n_; ++k) jacobians[0][n_ * i + k] = (i == k) ? k_ : 0.0;
+        return true;
+    }
+private:
+    double k_;
+    int n_;
 };
 
 
@@ -99,6 +148,9 @@ int main(int argc_in, char** argv_in) {
     std::vector<std::string> excluded;
     std::vector<char*> positional;
     double smooth_lambda = 0.0;
+    double offset_sigma_mm = 0.0;   // 0 = offsets fixed at the model's marker positions
+    bool shape_only = false;
+    double event_smooth_factor = 1.0;
     for (int i = 0; i < argc_in; ++i) {
         const std::string a = argv_in[i];
         if (a == "--no-arms") {
@@ -109,6 +161,13 @@ int main(int argc_in, char** argv_in) {
             while (std::getline(ss, p, ',')) if (!p.empty()) excluded.push_back(p);
         } else if (a == "--smooth" && i + 1 < argc_in) {
             smooth_lambda = std::stod(argv_in[++i]);
+        } else if (a == "--event-smooth-factor" && i + 1 < argc_in) {
+            event_smooth_factor = std::stod(argv_in[++i]);
+        } else if (a == "--shape-only") {
+            shape_only = true;
+        } else if (a == "--fit-offsets" && i + 1 < argc_in) {
+            offset_sigma_mm = std::stod(argv_in[++i]);
+            if (offset_sigma_mm <= 0) { std::cerr << "--fit-offsets needs a positive SIGMA_MM\n"; return 1; }
         } else {
             positional.push_back(argv_in[i]);
         }
@@ -119,7 +178,7 @@ int main(int argc_in, char** argv_in) {
     if (argc < 5) {
         std::cerr << "usage: spline_ik <model.osim> <markers.trc> <init_ik.mot> <out.mot>"
                      " [knot_spacing_s=0.05] [ik_setup.xml|-] [grf.mot] [dense_s=0.01] [before_s=0.03] [after_s=0.10]"
-                     " [--no-arms] [--exclude-bodies a,b,...] [--smooth LAMBDA]\n";
+                     " [--no-arms] [--exclude-bodies a,b,...] [--smooth LAMBDA] [--fit-offsets SIGMA_MM [--shape-only]] [--event-smooth-factor F]\n";
         return 1;
     }
     const double spacing = argc >= 6 ? std::stod(argv[5]) : 0.05;
@@ -163,6 +222,7 @@ int main(int argc_in, char** argv_in) {
 
         // ---- spline shape: uniform, or denser around foot events if a GRF file is given ----
         BSpline spline;
+        std::vector<double> event_windows;   // [start, end] pairs in spline time, around each foot event
         if (argc >= 8) {
             double dense = argc >= 9 ? std::stod(argv[8]) : 0.01;
             const double before = argc >= 10 ? std::stod(argv[9]) : 0.03;
@@ -176,6 +236,7 @@ int main(int argc_in, char** argv_in) {
             for (double& e : events) { std::cout << " " << e; e -= t_abs0; }   // to spline time
             std::cout << "\n";
             spline = make_clamped(0.0, T, event_knots(T, spacing, dense, events, before, after));
+            for (double e : events) { event_windows.push_back(e - before); event_windows.push_back(e + after); }
         } else {
             spline = make_uniform(0.0, T, std::max(1, static_cast<int>(std::lround(T / spacing))));
         }
@@ -209,6 +270,19 @@ int main(int argc_in, char** argv_in) {
         }
         const std::vector<std::vector<double>> c_start = c;
 
+        // ---- marker offsets (all zero = the model's marker positions) ----
+        const bool fit_offsets = offset_sigma_mm > 0;
+        if (shape_only && !fit_offsets) throw std::runtime_error("--shape-only needs --fit-offsets SIGMA_MM");
+        const OffsetMode mode = !fit_offsets ? OffsetMode::none : shape_only ? OffsetMode::shape : OffsetMode::full;
+        std::vector<double> d(3 * M, 0.0);   // offsets per marker (full mode: the unknowns themselves)
+        std::vector<int> seen(M, 0);         // frames in which each marker was observed
+        ShapeOffsets shape;
+        std::vector<std::vector<double>> z;  // shape mode: unknowns per body group
+        if (mode == OffsetMode::shape) {
+            shape = make_shape_offsets(fk.marker_frame_names(), fk.marker_locations());
+            for (int k : shape.size) z.emplace_back(k, 0.0);
+        }
+
         // ---- one residual block per frame ----
         ceres::Problem problem;
         std::vector<FrameData> frames_copy;   // kept for the error report after solving
@@ -227,6 +301,7 @@ int main(int argc_in, char** argv_in) {
                 if (pt.observed_coord) {
                     f.observed_marker_positions[m] = *pt.observed_coord;
                     ++observed;
+                    ++seen[m];
                 }
                 const double w = weights.count(name) ? weights[name] : 1.0;
                 f.scale[m] = std::sqrt(w) / pt.measurement_uncertainty.x_mm;   // OpenSim weights the squared error by w
@@ -234,8 +309,31 @@ int main(int argc_in, char** argv_in) {
             std::vector<double*> blocks;
             for (int j = 0; j < nq; ++j)
                 for (const ActiveCoef& ac : f.active) blocks.push_back(&c[j][ac.k]);
+            if (mode == OffsetMode::full)
+                for (int m = 0; m < M; ++m) blocks.push_back(&d[3 * m]);
+            if (mode == OffsetMode::shape)
+                for (size_t g = 0; g < z.size(); ++g) if (!z[g].empty()) blocks.push_back(z[g].data());
             frames_copy.push_back(f);
-            problem.AddResidualBlock(new FrameCost(&fk, std::move(f)), nullptr, blocks);
+            problem.AddResidualBlock(new FrameCost(&fk, std::move(f), mode, &shape), nullptr, blocks);
+        }
+        if (mode == OffsetMode::shape) {
+            int total = 0;
+            std::cout << "estimating shape-only marker offsets, prior " << offset_sigma_mm << " mm; unknowns per body:";
+            for (size_t g = 0; g < z.size(); ++g) {
+                std::cout << " " << shape.group_names[g] << " " << shape.size[g] << "/" << 3 * shape.members[g].size();
+                if (z[g].empty()) continue;
+                total += shape.size[g];
+                problem.AddResidualBlock(new OffsetPrior(offset_sigma_mm, shape.size[g]), nullptr, std::vector<double*>{z[g].data()});
+            }
+            std::cout << "  (" << total << " in all)\n";
+        }
+        if (mode == OffsetMode::full) {
+            for (int m = 0; m < M; ++m) {
+                if (seen[m] == 0) { problem.SetParameterBlockConstant(&d[3 * m]); continue; }   // nothing to learn from
+                problem.AddResidualBlock(new OffsetPrior(offset_sigma_mm, 3), nullptr, std::vector<double*>{&d[3 * m]});
+            }
+            std::cout << "estimating marker offsets: " << 3 * M << " more unknowns, prior "
+                      << offset_sigma_mm << " mm per axis\n";
         }
 
         // Range limits as bounds on each coefficient (each coefficient is its own parameter block).
@@ -258,16 +356,25 @@ int main(int argc_in, char** argv_in) {
                     const double b = basis(spline, k, t_frames[i], 2);
                     if (b != 0.0 || basis(spline, k, t_frames[i]) != 0.0) { ks.push_back(k); bdd.push_back(b); }
                 }
+                bool in_window = false;
+                for (size_t w = 0; w + 1 < event_windows.size(); w += 2)
+                    in_window = in_window || (t_frames[i] >= event_windows[w] && t_frames[i] <= event_windows[w + 1]);
+                const double lam_i = smooth_lambda * (in_window ? event_smooth_factor : 1.0);
                 for (int j = 0; j < nq; ++j) {
                     const double unit = fk.rotational()[j] ? 1.0 : rad_per_m;
-                    const double sw = std::sqrt(smooth_lambda * dt) * unit;
+                    const double sw = std::sqrt(lam_i * dt) * unit;
                     std::vector<double> w(bdd.size());
                     std::vector<double*> blocks;
                     for (size_t a = 0; a < ks.size(); ++a) { w[a] = sw * bdd[a]; blocks.push_back(&c[j][ks[a]]); }
                     problem.AddResidualBlock(new SmoothCost(std::move(w)), nullptr, blocks);
                 }
             }
-            std::cout << "roughness penalty lambda = " << smooth_lambda << "\n";
+            std::cout << "roughness penalty lambda = " << smooth_lambda;
+            if (event_smooth_factor != 1.0) {
+                if (event_windows.empty()) std::cout << " (--event-smooth-factor ignored: no GRF file)";
+                else std::cout << ", x " << event_smooth_factor << " around foot events";
+            }
+            std::cout << "\n";
         }
 
         // ---- solve ----
@@ -284,7 +391,7 @@ int main(int argc_in, char** argv_in) {
 
         // Ceres' cost includes the marker weights, so it is not a distance. Report real
         // marker errors in mm (unweighted): overall RMS, and the worst markers at the end.
-        auto marker_errors = [&](const std::vector<std::vector<double>>& coef,
+        auto marker_errors = [&](const std::vector<std::vector<double>>& coef, const std::vector<double>& offs,
                                  std::vector<double>& sum_sq, std::vector<int>& count) {
             sum_sq.assign(M, 0.0);
             count.assign(M, 0);
@@ -293,6 +400,7 @@ int main(int argc_in, char** argv_in) {
                 std::vector<double> q(nq, 0.0);
                 for (int j = 0; j < nq; ++j) q[j] = evaluate(spline, coef[j], t_frames[i]);
                 fk.marker_positions(q, pos);
+                if (fit_offsets) add_offsets(fk, offs, pos);
                 for (int m = 0; m < M; ++m) {
                     const auto& obs = frames_copy[i].observed_marker_positions[m];
                     if (!obs) continue;
@@ -308,9 +416,14 @@ int main(int argc_in, char** argv_in) {
             for (int m = 0; m < M; ++m) { a += s[m]; b += n[m]; }
             return std::sqrt(a / std::max(1L, b));
         };
+        if (mode == OffsetMode::shape) {   // offsets per marker from the shape unknowns
+            std::vector<const double*> zp;
+            for (const auto& v : z) zp.push_back(v.data());
+            shape.to_offsets(zp, M, d);
+        }
         std::vector<double> s0, s1; std::vector<int> n0, n1;
-        marker_errors(c_start, s0, n0);
-        marker_errors(c, s1, n1);
+        marker_errors(c_start, std::vector<double>(3 * M, 0.0), s0, n0);
+        marker_errors(c, d, s1, n1);
         std::cout << "RMS marker error (mm, unweighted): start " << overall_rms(s0, n0)
                   << " -> end " << overall_rms(s1, n1) << "\n";
         std::vector<int> order(M);
@@ -322,6 +435,20 @@ int main(int argc_in, char** argv_in) {
             std::cout << "  " << fk.marker_names()[order[i]] << " "
                       << std::sqrt(s1[order[i]] / std::max(1, n1[order[i]]));
         std::cout << "\n";
+
+        if (fit_offsets) {
+            const std::string path = offsets_csv_path(argv[4]);
+            write_offsets_csv(path, fk.marker_names(), fk.marker_body_names(), d, seen);
+            std::vector<int> big(M);
+            for (int m = 0; m < M; ++m) big[m] = m;
+            auto norm = [&](int m) { return std::sqrt(d[3*m]*d[3*m] + d[3*m+1]*d[3*m+1] + d[3*m+2]*d[3*m+2]) * 1000; };
+            std::sort(big.begin(), big.end(), [&](int a, int b) { return norm(a) > norm(b); });
+            double ss = 0;
+            for (int m = 0; m < M; ++m) ss += norm(m) * norm(m);
+            std::cout << "marker offsets: RMS length " << std::sqrt(ss / std::max(1, M)) << " mm; largest:";
+            for (int i = 0; i < std::min(5, M); ++i) std::cout << "  " << fk.marker_names()[big[i]] << " " << norm(big[i]);
+            std::cout << "\nwrote " << path << "\n";
+        }
 
         // ---- write q, and its exact derivatives from the splines: q-dot (_u) and q-ddot (_udot) ----
         std::vector<double> t_out(F);
